@@ -1,5 +1,3 @@
-# hydrosertao
-Sistema embarcado de irrigação inteligente para o semiárido nordestino, com monitoramento de umidade, controle automático e comunicação IoT.
 # 🌊🌵 HydroSertão
 
 Sistema embarcado de irrigação inteligente voltado para a agricultura no semiárido nordestino.
@@ -36,3 +34,39 @@ O projeto integra sistemas embarcados e Internet das Coisas (IoT), permitindo co
 ---
 
 ## 🧱 Estrutura do Projeto
+
+```
+HydroSertao/
+├── src/
+├── include/
+└── README.md
+```
+
+---
+
+## 🌐 Aplicação
+
+Projeto voltado para o semiárido nordestino, onde a gestão eficiente da água é essencial.
+
+---
+
+## 🚀 Tecnologias
+
+- RP2040 (BitDogLab)
+- Linguagem C
+- ADC
+- GPIO
+- Interrupções
+- Wi-Fi (IoT)
+
+---
+
+## 👨‍💻 Autor
+
+Jorgenaldo Moraes
+
+---
+
+## 📌 Status
+
+🚧 Em desenvolvimento
