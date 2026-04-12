@@ -69,4 +69,4 @@ Jorgenaldo Moraes
 
 ## 📌 Status
 
-🚧 Em desenvolvimento
+✅ Projeto Concluído
