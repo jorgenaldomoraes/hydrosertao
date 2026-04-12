@@ -25,7 +25,6 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
-set(PICO_CYW43_FIRMWARE_SOURCE "embedded")
 
 add_executable(hydrosertao
     src/main.c
@@ -44,7 +43,7 @@ target_include_directories(hydrosertao PRIVATE
 
 target_link_libraries(hydrosertao
     pico_stdlib
-    pico_cyw43_arch_lwip_threadsafe_background
+    pico_cyw43_arch_lwip_poll
     hardware_adc
     hardware_gpio
     hardware_i2c

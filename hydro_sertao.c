@@ -4,13 +4,10 @@
  * =====================================================================
  * Plataforma : BitDogLab (RP2040)
  * Autor      : Jorgenaldo Silva Moraes
- * Versão     : 1.1.0
+ * Versão     : 1.0.0
  *
  * Servidor HTTP embutido na porta 80
  * Acesse: http://IP_DA_PLACA no navegador da mesma rede Wi-Fi
- *
- * Buzzer de emergência: alterna ligado/desligado a cada 500 ms
- * sem uso de sleep_ms(), mantendo Wi-Fi e display ativos.
  * =====================================================================
  */
 
@@ -30,8 +27,8 @@
 #include "ssd1306.h"
 
 /* ─── Wi-Fi ──────────────────────────────────────────────────────── */
-#define WIFI_SSID           "NOME_DA_REDE"
-#define WIFI_PASSWORD       "SENHA_AQUI"
+#define WIFI_SSID           "SUA_REDE"
+#define WIFI_PASSWORD       "SUA_SENHA"
 
 /* ─── GPIOs ──────────────────────────────────────────────────────── */
 #define LED_R_PIN           13
@@ -55,32 +52,31 @@
 #define UART_TX_PIN         0
 #define UART_RX_PIN         1
 
-/* ─── Limiares e temporização ────────────────────────────────────── */
-#define UMIDADE_MINIMA      30.0f   /* % — abaixo: liga irrigacao     */
-#define UMIDADE_MAXIMA      70.0f   /* % — acima : desliga irrigacao  */
-#define INTERVALO_MS        1000    /* periodo de leitura dos sensores */
-#define BUZZER_EMERG_MS     500     /* periodo do alarme de emergencia */
-#define RESET_EMERG_MS      2000    /* tempo de pressao para reset     */
+/* ─── Limiares ───────────────────────────────────────────────────── */
+#define UMIDADE_MINIMA      30.0f
+#define UMIDADE_MAXIMA      70.0f
+#define INTERVALO_MS        1000
+#define BUZZER_EMERG_MS     500
 
 /* ─── Estado do sistema ──────────────────────────────────────────── */
 typedef struct {
-    float    umidade;         /* 0-100 %                        */
-    float    temperatura;     /* graus Celsius                  */
-    bool     irrigando;       /* irrigacao ativa                */
-    bool     emergencia;      /* modo de emergencia ativo       */
-    bool     modo_manual;     /* true = manual, false = auto    */
-    uint32_t tempo_irrigando; /* segundos totais irrigando      */
+    float    umidade;
+    float    temperatura;
+    bool     irrigando;
+    bool     emergencia;
+    bool     modo_manual;
+    uint32_t tempo_irrigando;
 } SistemaState;
 
-volatile SistemaState sistema         = {0};
-volatile bool         flag_modo_mudou = false;
-volatile bool         flag_emergencia = false;
+volatile SistemaState sistema = {0};
+volatile bool flag_modo_mudou  = false;
+volatile bool flag_emergencia  = false;
 
-/* ─── Controle do buzzer de emergencia (nao bloqueante) ─────────── */
+/* ─── Buzzer de emergência (não bloqueante) ──────────────────────── */
 static bool     buzzer_emerg_on = false;
 static uint32_t ultimo_bip      = 0;
 
-/* ─── Prototipos ─────────────────────────────────────────────────── */
+/* ─── Protótipos ─────────────────────────────────────────────────── */
 void  hardware_init(void);
 void  display_init(void);
 void  wifi_init(void);
@@ -99,15 +95,17 @@ void  callback_modo(void);
 
 /* ═══════════════════════════════════════════════════════════════════
  * SERVIDOR HTTP EMBUTIDO
+ * O lwIP com TCP_SND_BUF=8*MSS suporta ~11KB por envio.
+ * Usamos um buffer único e deixamos o lwIP fragmentar em pacotes.
  * ═══════════════════════════════════════════════════════════════════ */
 static char http_response[3000];
 
 static void montar_html(void) {
-    const char *cor_irrig = sistema.irrigando   ? "#2196F3" : "#9e9e9e";
-    const char *st_irrig  = sistema.irrigando   ? "LIGADA"  : "DESLIGADA";
-    const char *cor_emerg = sistema.emergencia  ? "#f44336" : "#4CAF50";
-    const char *st_emerg  = sistema.emergencia  ? "EMERGENCIA" : "NORMAL";
-    const char *st_modo   = sistema.modo_manual ? "MANUAL"  : "AUTO";
+    const char *cor_irrig = sistema.irrigando  ? "#2196F3" : "#9e9e9e";
+    const char *st_irrig  = sistema.irrigando  ? "LIGADA"  : "DESLIGADA";
+    const char *cor_emerg = sistema.emergencia ? "#f44336" : "#4CAF50";
+    const char *st_emerg  = sistema.emergencia ? "EMERGENCIA" : "NORMAL";
+    const char *st_modo   = sistema.modo_manual ? "MANUAL" : "AUTO";
     const char *cor_modo  = sistema.modo_manual ? "#FF9800" : "#4CAF50";
     int upct = (int)sistema.umidade;
     const char *cor_umid  = upct >= 30 ? "#4CAF50" : "#f44336";
@@ -166,10 +164,10 @@ static void montar_html(void) {
         "<div class='v'>%lu<span class='u'>s</span></div></div>"
         "</div>"
         "<div style='text-align:center'>"
-        "<a class='btn' href='/irrigar/on'>Ligar Irrigacao</a>"
-        "<a class='btn r' href='/irrigar/off'>Desligar Irrigacao</a>"
+        "<a class='btn' href='/irrigar/on'>Ligar</a>"
+        "<a class='btn r' href='/irrigar/off'>Desligar</a>"
         "</div>"
-        "<p class='f'>HydroSertao v1.1 | Jorgenaldo Silva Moraes | EmbarcaTech 2025</p>"
+        "<p class='f'>HydroSertao v1.0 | Jorgenaldo Silva Moraes | EmbarcaTech 2026</p>"
         "</body></html>",
         sistema.umidade, upct, cor_umid,
         sistema.temperatura,
@@ -185,16 +183,19 @@ static err_t http_sent_cb(void *arg, struct tcp_pcb *tpcb, uint16_t len) {
     return ERR_OK;
 }
 
-static err_t http_callback(void *arg, struct tcp_pcb *tpcb,
-                            struct pbuf *p, err_t err) {
+static err_t http_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
     if (p == NULL) { tcp_close(tpcb); return ERR_OK; }
+
     char *req = (char *)p->payload;
     if (strstr(req, "GET /irrigar/on"))  controlar_irrigacao(true);
     if (strstr(req, "GET /irrigar/off")) controlar_irrigacao(false);
     pbuf_free(p);
+
     montar_html();
+
     uint16_t len = (uint16_t)strlen(http_response);
     tcp_sent(tpcb, http_sent_cb);
+
     err_t we = tcp_write(tpcb, http_response, len, TCP_WRITE_FLAG_COPY);
     if (we == ERR_OK) {
         tcp_output(tpcb);
@@ -221,6 +222,7 @@ void start_http_server(void) {
     log_serial("Servidor HTTP OK na porta 80.");
 }
 
+
 /* ═══════════════════════════════════════════════════════════════════
  * MAIN
  * ═══════════════════════════════════════════════════════════════════ */
@@ -228,7 +230,7 @@ int main(void) {
     stdio_init_all();
     sleep_ms(2000);
 
-    log_serial("=== HydroSertao v1.1.0 ===");
+    log_serial("=== HydroSertao v1.0.0 ===");
 
     hardware_init();
     display_init();
@@ -245,17 +247,17 @@ int main(void) {
     while (true) {
         uint32_t agora = to_ms_since_boot(get_absolute_time());
 
-        /* ── Botao B: troca de modo (flag vinda da IRQ) ── */
+        /* ── Processa Botão B (modo) fora da IRQ ── */
         if (flag_modo_mudou) {
-            flag_modo_mudou     = false;
+            flag_modo_mudou = false;
             sistema.modo_manual = !sistema.modo_manual;
             buzzer_beep(sistema.modo_manual ? 600 : 1000, 80);
             log_serial(sistema.modo_manual ? "Modo: MANUAL" : "Modo: AUTO");
         }
 
-        /* ── Botao A: ativa emergencia (flag vinda da IRQ) ── */
+        /* ── Processa Botão A (emergência) fora da IRQ ── */
         if (flag_emergencia) {
-            flag_emergencia    = false;
+            flag_emergencia = false;
             sistema.emergencia = true;
             sistema.irrigando  = false;
             controlar_irrigacao(false);
@@ -263,14 +265,7 @@ int main(void) {
             log_serial("EMERGENCIA ativada!");
         }
 
-        /* ── Buzzer intermitente de emergencia (nao bloqueante) ──────
-         * A cada BUZZER_EMERG_MS (500 ms) alterna entre buzzer_ligar()
-         * e buzzer_desligar() usando apenas timestamp — sem sleep_ms().
-         * Isso garante que cyw43_arch_poll() nunca seja bloqueado
-         * durante o alarme, mantendo Wi-Fi e display funcionando.
-         * Os bips normais (buzzer_beep) continuam disponiveis fora
-         * do estado de emergencia para confirmacoes de acao.
-         * ─────────────────────────────────────────────────────────── */
+        /* ── Buzzer intermitente de emergência (sem sleep!) ── */
         if (sistema.emergencia) {
             if ((agora - ultimo_bip) >= BUZZER_EMERG_MS) {
                 ultimo_bip = agora;
@@ -287,14 +282,14 @@ int main(void) {
             buzzer_emerg_on = false;
         }
 
-        /* ── Leitura periodica dos sensores (1 s) ── */
+        /* ── Leitura periódica ── */
         if ((agora - ultimo_leitura) >= INTERVALO_MS) {
             ultimo_leitura = agora;
 
             sistema.umidade     = ler_umidade();
             sistema.temperatura = ler_temperatura();
 
-            /* Controle automatico — inativo em emergencia ou modo manual */
+            /* Controle automático */
             if (!sistema.emergencia && !sistema.modo_manual) {
                 if (sistema.umidade < UMIDADE_MINIMA && !sistema.irrigando) {
                     controlar_irrigacao(true);
@@ -321,13 +316,13 @@ int main(void) {
             contador++;
         }
 
-        /* ── Reset de emergencia: manter Botao A pressionado 2 s ── */
+        /* ── Reset de emergência: segurar Botão A por 2s ── */
         if (sistema.emergencia && !gpio_get(BTN_A_PIN)) {
             uint32_t t0 = to_ms_since_boot(get_absolute_time());
             while (!gpio_get(BTN_A_PIN)) {
                 cyw43_arch_poll();
                 sleep_ms(10);
-                if ((to_ms_since_boot(get_absolute_time()) - t0) >= RESET_EMERG_MS) {
+                if ((to_ms_since_boot(get_absolute_time()) - t0) >= 2000) {
                     sistema.emergencia = false;
                     buzzer_desligar();
                     buzzer_emerg_on = false;
@@ -338,6 +333,7 @@ int main(void) {
             }
         }
 
+        /* ── Mantém Wi-Fi e servidor HTTP vivos ── */
         cyw43_arch_poll();
         sleep_ms(10);
     }
@@ -384,12 +380,13 @@ void hardware_init(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * DISPLAY INIT
+ * DISPLAY INIT — splash screen com logo 🌊🌵
  * ═══════════════════════════════════════════════════════════════════ */
 void display_init(void) {
     ssd1306_init();
     ssd1306_clear();
 
+    /* Onda sinusoidal no topo */
     int onda[] = {
         8,7,6,5,5,6,7,8,9,10,10,9, 8,7,6,5,5,6,7,8,9,10,10,9,
         8,7,6,5,5,6,7,8,9,10,10,9, 8,7,6,5,5,6,7,8,9,10,10,9,
@@ -403,15 +400,17 @@ void display_init(void) {
         ssd1306_draw_pixel(x, onda[x] + 1, true);
     }
 
-    for (int y = 2; y < 13; y++)     ssd1306_draw_pixel(122, y, true);
-    for (int x = 118; x <= 122; x++) ssd1306_draw_pixel(x, 6, true);
-    for (int y = 4;   y <= 6;   y++) ssd1306_draw_pixel(118, y, true);
-    for (int x = 122; x <= 126; x++) ssd1306_draw_pixel(x, 8, true);
-    for (int y = 6;   y <= 8;   y++) ssd1306_draw_pixel(126, y, true);
+    /* Cacto à direita */
+    for (int y = 2; y < 13; y++)       ssd1306_draw_pixel(122, y, true); /* tronco */
+    for (int x = 118; x <= 122; x++)   ssd1306_draw_pixel(x, 6, true);  /* braço esq */
+    for (int y = 4;   y <= 6;   y++)   ssd1306_draw_pixel(118, y, true);
+    for (int x = 122; x <= 126; x++)   ssd1306_draw_pixel(x, 8, true);  /* braço dir */
+    for (int y = 6;   y <= 8;   y++)   ssd1306_draw_pixel(126, y, true);
 
+    /* Textos da splash screen */
     ssd1306_draw_string(12, 16, "** HydroSertao **");
     ssd1306_draw_string(6,  28, "Irrigacao Inteligente");
-    ssd1306_draw_string(16, 40, "EmbarcaTech 2025");
+    ssd1306_draw_string(16, 40, "EmbarcaTech 2026");
     ssd1306_draw_string(10, 52, "Jorgenaldo Moraes");
 
     ssd1306_show();
@@ -420,7 +419,7 @@ void display_init(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * WI-FI INIT
+ * WI-FI INIT — exibe IP no display após conexão
  * ═══════════════════════════════════════════════════════════════════ */
 void wifi_init(void) {
     if (cyw43_arch_init()) { log_serial("ERRO: Wi-Fi!"); return; }
@@ -483,12 +482,8 @@ float ler_temperatura(void) {
 void controlar_irrigacao(bool ligar) {
     sistema.irrigando = ligar;
     set_led(false, !ligar, ligar);
-    if (ligar) {
-        buzzer_beep(800, 150);
-        log_serial("Irrigacao: LIGADA");
-    } else {
-        log_serial("Irrigacao: DESLIGADA");
-    }
+    if (ligar) { buzzer_beep(800, 150); log_serial("Irrigacao: LIGADA"); }
+    else       { log_serial("Irrigacao: DESLIGADA"); }
 }
 
 void set_led(bool r, bool g, bool b) {
@@ -497,7 +492,6 @@ void set_led(bool r, bool g, bool b) {
     gpio_put(LED_B_PIN, b);
 }
 
-/* Liga o buzzer via PWM de forma continua (sem bloqueio) */
 void buzzer_ligar(uint32_t freq_hz) {
     uint slice = pwm_gpio_to_slice_num(BUZZER_PIN);
     uint chan  = pwm_gpio_to_channel(BUZZER_PIN);
@@ -509,13 +503,11 @@ void buzzer_ligar(uint32_t freq_hz) {
     pwm_set_enabled(slice, true);
 }
 
-/* Desliga o buzzer imediatamente */
 void buzzer_desligar(void) {
     pwm_set_enabled(pwm_gpio_to_slice_num(BUZZER_PIN), false);
     gpio_put(BUZZER_PIN, 0);
 }
 
-/* Bip bloqueante — confirmacoes pontuais fora da emergencia */
 void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms) {
     buzzer_ligar(freq_hz);
     sleep_ms(duracao_ms);
@@ -523,7 +515,7 @@ void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * DISPLAY OLED — atualizacao periodica
+ * DISPLAY OLED — atualização periódica
  * ═══════════════════════════════════════════════════════════════════ */
 void atualizar_display(void) {
     ssd1306_clear();
@@ -566,7 +558,7 @@ void log_serial(const char *msg) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * CALLBACKS — apenas sinalizam flags; zero processamento em IRQ
+ * CALLBACKS — só flags, zero bloqueio
  * ═══════════════════════════════════════════════════════════════════ */
 void callback_emergencia(uint gpio, uint32_t events) {
     if (gpio == BTN_A_PIN && (events & GPIO_IRQ_EDGE_FALL))
