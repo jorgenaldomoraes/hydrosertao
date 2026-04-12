@@ -4,7 +4,7 @@
  * =====================================================================
  * Plataforma : BitDogLab (RP2040)
  * Autor      : Jorgenaldo Silva Moraes
- * Versão     : 1.0.0
+ * Versão     : 1.0.1
  *
  * Servidor HTTP embutido — acesse http://IP_DA_PLACA no navegador
  * =====================================================================
@@ -32,8 +32,8 @@
 #define NUM_LEDS        25
 
 /* ─── Wi-Fi ──────────────────────────────────────────────────────── */
-#define WIFI_SSID       "Tayna"
-#define WIFI_PASSWORD   "Silva123"
+#define WIFI_SSID           "SUA_REDE"
+#define WIFI_PASSWORD       "SUA_SENHA"
 
 /* ─── GPIOs ──────────────────────────────────────────────────────── */
 #define LED_R_PIN       13
@@ -60,7 +60,8 @@
 /* ─── Limiares ───────────────────────────────────────────────────── */
 #define UMIDADE_MINIMA  30.0f
 #define UMIDADE_MAXIMA  70.0f
-#define INTERVALO_MS    1000
+#define INTERVALO_MS        1000
+#define BUZZER_EMERG_MS     500
 
 /* ─── Estado ─────────────────────────────────────────────────────── */
 typedef struct {
@@ -74,7 +75,9 @@ typedef struct {
 
 volatile SistemaState sistema = {0};
 volatile bool flag_modo_mudou = false;
-volatile bool flag_emergencia = false;
+volatile bool flag_emergencia  = false;
+static uint32_t ultimo_bip      = 0;
+static bool     buzzer_emerg_on = false;
 
 /* ─── WS2812 via PIO ─────────────────────────────────────────────── */
 static PIO  ws_pio    = pio0;
@@ -125,6 +128,8 @@ float ler_umidade(void);
 float ler_temperatura(void);
 void controlar_irrigacao(bool ligar);
 void set_led(bool r, bool g, bool b);
+void buzzer_ligar(uint32_t freq_hz);
+void buzzer_desligar(void);
 void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms);
 void atualizar_display(void);
 void atualizar_matriz(void);
@@ -189,7 +194,7 @@ static void criar_pagina_html(void) {
         "<a class='btn' href='/irrigar/on'>Ligar Irrigacao</a>"
         "<a class='btn red' href='/irrigar/off'>Desligar Irrigacao</a>"
         "</div>"
-        "<p class='foot'>HydroSertao v1.0 | Jorgenaldo Silva Moraes | EmbarcaTech 2025</p>"
+        "<p class='foot'>HydroSertao v1.0 | Jorgenaldo Silva Moraes | EmbarcaTech 2026</p>"
         "</body></html>\r\n",
         sistema.umidade, upct, cor_umid,
         sistema.temperatura,
@@ -263,6 +268,7 @@ int main(void) {
             flag_emergencia = false;
             sistema.emergencia = true;
             sistema.irrigando  = false;
+            ultimo_bip = agora;
             set_led(true, false, false);
             log_serial("EMERGENCIA ativada!");
         }
@@ -457,7 +463,7 @@ void set_led(bool r, bool g, bool b) {
     gpio_put(LED_B_PIN, b);
 }
 
-void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms) {
+void buzzer_ligar(uint32_t freq_hz) {
     uint slice = pwm_gpio_to_slice_num(BUZZER_PIN);
     uint chan  = pwm_gpio_to_channel(BUZZER_PIN);
     uint32_t div = 125000000 / (freq_hz * 4096);
@@ -466,9 +472,18 @@ void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms) {
     pwm_set_wrap(slice, 4095);
     pwm_set_chan_level(slice, chan, 2048);
     pwm_set_enabled(slice, true);
+}
+
+void buzzer_desligar(void) {
+    uint slice = pwm_gpio_to_slice_num(BUZZER_PIN);
+    uint chan  = pwm_gpio_to_channel(BUZZER_PIN);
+    pwm_set_chan_level(slice, chan, 0);
+}
+
+void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms) {
+    buzzer_ligar(freq_hz);
     sleep_ms(duracao_ms);
-    pwm_set_enabled(slice, false);
-    gpio_put(BUZZER_PIN, 0);
+    buzzer_desligar();
 }
 
 /* ═══════════════════════════════════════════════════════════════════
