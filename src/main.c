@@ -32,8 +32,8 @@
 #define NUM_LEDS        25
 
 /* ─── Wi-Fi ──────────────────────────────────────────────────────── */
-#define WIFI_SSID       "Tayna_5GHz"
-#define WIFI_PASSWORD   "Silva@123"
+#define WIFI_SSID       "Tayna"
+#define WIFI_PASSWORD   "Silva123"
 
 /* ─── GPIOs ──────────────────────────────────────────────────────── */
 #define LED_R_PIN       13

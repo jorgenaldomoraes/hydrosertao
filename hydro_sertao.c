@@ -4,9 +4,13 @@
  * =====================================================================
  * Plataforma : BitDogLab (RP2040)
  * Autor      : Jorgenaldo Silva Moraes
- * Versão     : 1.0.0
+ * Versão     : 1.1.0
  *
- * Servidor HTTP embutido — acesse http://IP_DA_PLACA no navegador
+ * Servidor HTTP embutido na porta 80
+ * Acesse: http://IP_DA_PLACA no navegador da mesma rede Wi-Fi
+ *
+ * Buzzer de emergência: alterna ligado/desligado a cada 500 ms
+ * sem uso de sleep_ms(), mantendo Wi-Fi e display ativos.
  * =====================================================================
  */
 
@@ -21,135 +25,89 @@
 #include "hardware/uart.h"
 #include "hardware/irq.h"
 #include "hardware/pwm.h"
-#include "hardware/pio.h"
-#include "hardware/clocks.h"
 #include "lwip/tcp.h"
 #include "lwip/ip_addr.h"
 #include "ssd1306.h"
 
-/* ─── WS2812 ─────────────────────────────────────────────────────── */
-#define WS2812_PIN      7
-#define NUM_LEDS        25
-
 /* ─── Wi-Fi ──────────────────────────────────────────────────────── */
-#define WIFI_SSID       "NOME_DA_REDE"
-#define WIFI_PASSWORD   "SENHA_AQUI"
+#define WIFI_SSID           "NOME_DA_REDE"
+#define WIFI_PASSWORD       "SENHA_AQUI"
 
 /* ─── GPIOs ──────────────────────────────────────────────────────── */
-#define LED_R_PIN       13
-#define LED_G_PIN       11
-#define LED_B_PIN       12
-#define BUZZER_PIN      21
-#define BTN_A_PIN       5
-#define BTN_B_PIN       6
-#define JOYSTICK_Y_ADC  1
-#define TEMP_ADC        4
+#define LED_R_PIN           13
+#define LED_G_PIN           11
+#define LED_B_PIN           12
+#define BUZZER_PIN          21
+#define BTN_A_PIN           5
+#define BTN_B_PIN           6
+#define JOYSTICK_Y_ADC      1
+#define TEMP_ADC            4
 
 /* ─── I2C ────────────────────────────────────────────────────────── */
-#define I2C_PORT        i2c1
-#define I2C_SDA_PIN     14
-#define I2C_SCL_PIN     15
-#define I2C_FREQ        400000
+#define I2C_PORT            i2c1
+#define I2C_SDA_PIN         14
+#define I2C_SCL_PIN         15
+#define I2C_FREQ            400000
 
 /* ─── UART ───────────────────────────────────────────────────────── */
-#define UART_PORT       uart0
-#define UART_BAUD       115200
-#define UART_TX_PIN     0
-#define UART_RX_PIN     1
+#define UART_PORT           uart0
+#define UART_BAUD           115200
+#define UART_TX_PIN         0
+#define UART_RX_PIN         1
 
-/* ─── Limiares ───────────────────────────────────────────────────── */
-#define UMIDADE_MINIMA  30.0f
-#define UMIDADE_MAXIMA  70.0f
-#define INTERVALO_MS    1000
+/* ─── Limiares e temporização ────────────────────────────────────── */
+#define UMIDADE_MINIMA      30.0f   /* % — abaixo: liga irrigacao     */
+#define UMIDADE_MAXIMA      70.0f   /* % — acima : desliga irrigacao  */
+#define INTERVALO_MS        1000    /* periodo de leitura dos sensores */
+#define BUZZER_EMERG_MS     500     /* periodo do alarme de emergencia */
+#define RESET_EMERG_MS      2000    /* tempo de pressao para reset     */
 
-/* ─── Estado ─────────────────────────────────────────────────────── */
+/* ─── Estado do sistema ──────────────────────────────────────────── */
 typedef struct {
-    float    umidade;
-    float    temperatura;
-    bool     irrigando;
-    bool     emergencia;
-    bool     modo_manual;
-    uint32_t tempo_irrigando;
+    float    umidade;         /* 0-100 %                        */
+    float    temperatura;     /* graus Celsius                  */
+    bool     irrigando;       /* irrigacao ativa                */
+    bool     emergencia;      /* modo de emergencia ativo       */
+    bool     modo_manual;     /* true = manual, false = auto    */
+    uint32_t tempo_irrigando; /* segundos totais irrigando      */
 } SistemaState;
 
-volatile SistemaState sistema = {0};
-volatile bool flag_modo_mudou = false;
-volatile bool flag_emergencia = false;
+volatile SistemaState sistema         = {0};
+volatile bool         flag_modo_mudou = false;
+volatile bool         flag_emergencia = false;
 
-/* ─── WS2812 via PIO — programa oficial ─────────────────────────── */
-static PIO  ws_pio    = pio0;
-static uint ws_sm     = 0;
-static uint ws_offset = 0;
+/* ─── Controle do buzzer de emergencia (nao bloqueante) ─────────── */
+static bool     buzzer_emerg_on = false;
+static uint32_t ultimo_bip      = 0;
 
-// Programa PIO oficial para WS2812 (800kHz)
-// Programa PIO WS2812 — versão simples e confiável
-// Usa SET para controlar o pino diretamente (sem sideset)
-// Cada bit = 10 ciclos @ 10MHz efetivo = 1us por bit ~800kbps
-static const uint16_t ws2812_program_instructions[] = {
-    0xe081, //  0: set    pins, 1    [0]   sobe
-    0x6221, //  1: out    x, 1       [2]   lê bit, aguarda T1
-    0x1045, //  2: jmp    x-- 5      [0]   bit=1: fica alto mais tempo
-    0xe080, //  3: set    pins, 0    [4]   bit=0: desce logo
-    0x0000, //  4: jmp    0          [0]   próximo bit
-    0xe080, //  5: set    pins, 0    [0]   bit=1: desce
-    0x0000, //  6: jmp    0          [0]   próximo bit
-};
-
-static const struct pio_program ws2812_program = {
-    .instructions = ws2812_program_instructions,
-    .length       = 7,
-    .origin       = -1,
-};
-
-static inline void ws2812_put_pixel(uint32_t grb) {
-    pio_sm_put_blocking(ws_pio, ws_sm, grb << 8u);
-}
-static inline uint32_t urgb(uint8_t r, uint8_t g, uint8_t b) {
-    return ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
-}
-
-static const uint8_t padrao_gota[25]   = {0,0,1,0,0, 0,1,1,1,0, 1,1,1,1,1, 1,1,1,1,1, 0,1,1,1,0};
-static const uint8_t padrao_sol[25]    = {1,0,1,0,1, 0,1,1,1,0, 1,1,1,1,1, 0,1,1,1,0, 1,0,1,0,1};
-static const uint8_t padrao_x[25]      = {1,0,0,0,1, 0,1,0,1,0, 0,0,1,0,0, 0,1,0,1,0, 1,0,0,0,1};
-static const uint8_t padrao_manual[25] = {0,1,1,1,0, 0,0,0,1,0, 0,0,1,0,0, 0,0,0,0,0, 0,0,1,0,0};
-
-void matriz_mostrar(const uint8_t *p, uint8_t r, uint8_t g, uint8_t b) {
-    for (int i = 0; i < NUM_LEDS; i++)
-        ws2812_put_pixel(p[i] ? urgb(r, g, b) : urgb(0, 0, 0));
-    sleep_us(300);
-}
-void matriz_apagar(void) {
-    for (int i = 0; i < NUM_LEDS; i++) ws2812_put_pixel(urgb(0, 0, 0));
-    sleep_us(300);
-}
-
-/* ─── Buffer HTTP ────────────────────────────────────────────────── */
-static char http_response[3000];
-
-/* ─── Protótipos ─────────────────────────────────────────────────── */
-void hardware_init(void);
-void ws2812_init(void);
-void display_init(void);
-void wifi_init(void);
-void start_http_server(void);
+/* ─── Prototipos ─────────────────────────────────────────────────── */
+void  hardware_init(void);
+void  display_init(void);
+void  wifi_init(void);
+void  start_http_server(void);
 float ler_umidade(void);
 float ler_temperatura(void);
-void controlar_irrigacao(bool ligar);
-void set_led(bool r, bool g, bool b);
-void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms);
-void atualizar_display(void);
-void atualizar_matriz(void);
-void log_serial(const char *msg);
-void callback_emergencia(uint gpio, uint32_t events);
-void callback_modo(void);
+void  controlar_irrigacao(bool ligar);
+void  set_led(bool r, bool g, bool b);
+void  buzzer_ligar(uint32_t freq_hz);
+void  buzzer_desligar(void);
+void  buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms);
+void  atualizar_display(void);
+void  log_serial(const char *msg);
+void  callback_emergencia(uint gpio, uint32_t events);
+void  callback_modo(void);
 
-/* ─── Servidor HTTP embutido ─────────────────────────────────────── */
-static void criar_pagina_html(void) {
-    const char *cor_irrig = sistema.irrigando  ? "#2196F3" : "#9e9e9e";
-    const char *st_irrig  = sistema.irrigando  ? "LIGADA"  : "DESLIGADA";
-    const char *cor_emerg = sistema.emergencia ? "#f44336" : "#4CAF50";
-    const char *st_emerg  = sistema.emergencia ? "EMERGENCIA" : "NORMAL";
-    const char *st_modo   = sistema.modo_manual ? "MANUAL" : "AUTOMATICO";
+/* ═══════════════════════════════════════════════════════════════════
+ * SERVIDOR HTTP EMBUTIDO
+ * ═══════════════════════════════════════════════════════════════════ */
+static char http_response[3000];
+
+static void montar_html(void) {
+    const char *cor_irrig = sistema.irrigando   ? "#2196F3" : "#9e9e9e";
+    const char *st_irrig  = sistema.irrigando   ? "LIGADA"  : "DESLIGADA";
+    const char *cor_emerg = sistema.emergencia  ? "#f44336" : "#4CAF50";
+    const char *st_emerg  = sistema.emergencia  ? "EMERGENCIA" : "NORMAL";
+    const char *st_modo   = sistema.modo_manual ? "MANUAL"  : "AUTO";
     const char *cor_modo  = sistema.modo_manual ? "#FF9800" : "#4CAF50";
     int upct = (int)sistema.umidade;
     const char *cor_umid  = upct >= 30 ? "#4CAF50" : "#f44336";
@@ -157,64 +115,62 @@ static void criar_pagina_html(void) {
     snprintf(http_response, sizeof(http_response),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
-        "Refresh: 3\r\n\r\n"
+        "Connection: close\r\nRefresh: 3\r\n\r\n"
         "<!DOCTYPE html><html><head>"
-        "<meta charset='UTF-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>HydroSertao</title>"
-        "<style>"
-        "body{font-family:Arial,sans-serif;background:#f0f4f8;padding:16px;margin:0}"
-        "h1{text-align:center;color:#1a5276;margin-bottom:4px}"
-        ".sub{text-align:center;color:#888;font-size:12px;margin-bottom:16px}"
-        ".grid{display:flex;flex-wrap:wrap;gap:12px;justify-content:center}"
-        ".card{background:#fff;border-radius:14px;padding:18px;min-width:160px;"
-        "text-align:center;box-shadow:0 3px 8px rgba(0,0,0,.1)}"
-        ".lbl{font-size:11px;color:#999;text-transform:uppercase;margin-bottom:6px}"
-        ".val{font-size:34px;font-weight:bold;color:#1a5276}"
-        ".unit{font-size:15px;color:#888}"
-        ".badge{padding:7px 14px;border-radius:20px;color:#fff;"
-        "font-weight:bold;font-size:13px;display:inline-block;margin-top:6px}"
-        ".bar-bg{background:#e0e0e0;border-radius:6px;height:12px;margin-top:8px;overflow:hidden}"
-        ".bar{height:100%%;border-radius:6px}"
-        ".foot{text-align:center;color:#bbb;font-size:11px;margin-top:20px}"
-        "a.btn{display:inline-block;margin:4px;padding:8px 16px;border-radius:8px;"
-        "background:#1a5276;color:#fff;text-decoration:none;font-size:13px}"
-        "a.btn.red{background:#c0392b}"
+        "<meta charset=UTF-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>HydroSertao</title><style>"
+        "body{font-family:Arial,sans-serif;background:#f0f4f8;padding:12px;margin:0}"
+        ".g{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin:10px 0}"
+        ".c{background:#fff;border-radius:12px;padding:14px;min-width:140px;text-align:center;"
+        "box-shadow:0 2px 6px rgba(0,0,0,.1)}"
+        ".l{font-size:10px;color:#999;text-transform:uppercase;margin-bottom:4px}"
+        ".v{font-size:30px;font-weight:bold;color:#1a5276}"
+        ".u{font-size:13px;color:#888}"
+        ".b{padding:6px 12px;border-radius:16px;color:#fff;font-weight:bold;"
+        "font-size:12px;display:inline-block;margin-top:5px}"
+        ".bg{background:#e0e0e0;border-radius:5px;height:10px;margin-top:6px;overflow:hidden}"
+        ".br{height:100%%;border-radius:5px}"
+        "a.btn{display:inline-block;margin:4px;padding:7px 14px;border-radius:8px;"
+        "background:#1a5276;color:#fff;text-decoration:none;font-size:12px}"
+        "a.r{background:#c0392b}"
+        ".f{text-align:center;color:#bbb;font-size:10px;margin-top:12px}"
         "</style></head><body>"
-        "<div style='text-align:center;padding:12px 0 4px'>"
-        "<svg width='180' height='48' viewBox='0 0 180 48' xmlns='http://www.w3.org/2000/svg'>"
-        "<text x='8' y='36' font-family=\'Arial\' font-size='36' font-weight='bold' fill='#1a5276'>H</text>"
-        "<text x='30' y='36' font-family=\'Arial\' font-size='36' font-weight='bold' fill='#2196F3'>y</text>"
-        "<text x='50' y='36' font-family=\'Arial\' font-size='36' font-weight='bold' fill='#1a5276'>dro</text>"
-        "<path d='M2 44 Q20 30 38 44 Q56 58 74 44' stroke='#2196F3' stroke-width='3' fill='none'/>"
-        "<text x='96' y='36' font-family=\'Arial\' font-size='36' font-weight='bold' fill='#2e7d32'>S</text>"
-        "<text x='116' y='36' font-family=\'Arial\' font-size='36' font-weight='bold' fill='#388e3c'>er</text>"
-        "<text x='146' y='36' font-family=\'Arial\' font-size='36' font-weight='bold' fill='#1b5e20'>t</text>"
-        "<text x='158' y='36' font-family=\'Arial\' font-size='28' font-weight='bold' fill='#2e7d32'>&#227;o</text>"
-        "<line x1='88' y1='8' x2='88' y2='44' stroke='#bbb' stroke-width='1'/>"
-        "<polygon points='84,10 88,2 92,10' fill='#4CAF50'/>"
-        "<polygon points='82,18 88,10 94,18 90,18 90,28 86,28 86,18' fill='#388e3c'/>"
+        "<div style='text-align:center;padding:6px 0'>"
+        "<svg width='200' height='42' viewBox='0 0 200 42'>"
+        "<path d='M0 32Q10 20 20 32Q30 44 40 32Q50 20 60 32'"
+        " stroke='#2196F3' stroke-width='3' fill='none'/>"
+        "<line x1='74' y1='40' x2='74' y2='12' stroke='#2e7d32' stroke-width='4'/>"
+        "<line x1='63' y1='25' x2='74' y2='25' stroke='#2e7d32' stroke-width='3'/>"
+        "<line x1='63' y1='16' x2='63' y2='25' stroke='#2e7d32' stroke-width='3'/>"
+        "<line x1='85' y1='21' x2='74' y2='21' stroke='#2e7d32' stroke-width='3'/>"
+        "<line x1='85' y1='12' x2='85' y2='21' stroke='#2e7d32' stroke-width='3'/>"
+        "<text x='94' y='32' font-family='Arial' font-size='24'"
+        " font-weight='bold' fill='#1a5276'>Hydro</text>"
+        "<text x='148' y='32' font-family='Arial' font-size='24'"
+        " font-weight='bold' fill='#2e7d32'>Sertao</text>"
         "</svg></div>"
-        "<p class='sub'>Dashboard IoT | Atualiza a cada 3s</p>"
-        "<div class='grid'>"
-        "<div class='card'><div class='lbl'>Umidade</div>"
-        "<div class='val'>%.1f<span class='unit'>%%</span></div>"
-        "<div class='bar-bg'><div class='bar' style='width:%d%%;background:%s'></div></div></div>"
-        "<div class='card'><div class='lbl'>Temperatura</div>"
-        "<div class='val'>%.1f<span class='unit'>C</span></div></div>"
-        "<div class='card'><div class='lbl'>Status</div>"
-        "<div class='badge' style='background:%s'>%s</div><br>"
-        "<div class='badge' style='background:%s'>%s</div><br>"
-        "<div class='badge' style='background:%s'>%s</div></div>"
-        "<div class='card'><div class='lbl'>Tempo Irrigando</div>"
-        "<div class='val'>%lu<span class='unit'>s</span></div></div>"
+        "<p style='text-align:center;color:#888;font-size:11px;margin:0 0 10px'>"
+        "Dashboard IoT | Atualiza a cada 3s</p>"
+        "<div class='g'>"
+        "<div class='c'><div class='l'>Umidade</div>"
+        "<div class='v'>%.1f<span class='u'>%%</span></div>"
+        "<div class='bg'><div class='br' style='width:%d%%;background:%s'></div></div></div>"
+        "<div class='c'><div class='l'>Temperatura</div>"
+        "<div class='v'>%.1f<span class='u'>C</span></div></div>"
+        "<div class='c'><div class='l'>Status</div>"
+        "<div class='b' style='background:%s'>%s</div><br>"
+        "<div class='b' style='background:%s'>%s</div><br>"
+        "<div class='b' style='background:%s'>%s</div></div>"
+        "<div class='c'><div class='l'>T.Irrigando</div>"
+        "<div class='v'>%lu<span class='u'>s</span></div></div>"
         "</div>"
-        "<div style='text-align:center;margin-top:16px'>"
+        "<div style='text-align:center'>"
         "<a class='btn' href='/irrigar/on'>Ligar Irrigacao</a>"
-        "<a class='btn red' href='/irrigar/off'>Desligar Irrigacao</a>"
+        "<a class='btn r' href='/irrigar/off'>Desligar Irrigacao</a>"
         "</div>"
-        "<p class='foot'>HydroSertao v1.0 | Jorgenaldo Silva Moraes | EmbarcaTech 2025</p>"
-        "</body></html>\r\n",
+        "<p class='f'>HydroSertao v1.1 | Jorgenaldo Silva Moraes | EmbarcaTech 2025</p>"
+        "</body></html>",
         sistema.umidade, upct, cor_umid,
         sistema.temperatura,
         cor_irrig, st_irrig,
@@ -224,15 +180,28 @@ static void criar_pagina_html(void) {
     );
 }
 
-static err_t http_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
+static err_t http_sent_cb(void *arg, struct tcp_pcb *tpcb, uint16_t len) {
+    tcp_close(tpcb);
+    return ERR_OK;
+}
+
+static err_t http_callback(void *arg, struct tcp_pcb *tpcb,
+                            struct pbuf *p, err_t err) {
     if (p == NULL) { tcp_close(tpcb); return ERR_OK; }
     char *req = (char *)p->payload;
     if (strstr(req, "GET /irrigar/on"))  controlar_irrigacao(true);
     if (strstr(req, "GET /irrigar/off")) controlar_irrigacao(false);
-    criar_pagina_html();
-    tcp_write(tpcb, http_response, strlen(http_response), TCP_WRITE_FLAG_COPY);
-    tcp_output(tpcb);
     pbuf_free(p);
+    montar_html();
+    uint16_t len = (uint16_t)strlen(http_response);
+    tcp_sent(tpcb, http_sent_cb);
+    err_t we = tcp_write(tpcb, http_response, len, TCP_WRITE_FLAG_COPY);
+    if (we == ERR_OK) {
+        tcp_output(tpcb);
+    } else {
+        log_serial("ERRO: tcp_write HTTP.");
+        tcp_close(tpcb);
+    }
     return ERR_OK;
 }
 
@@ -243,11 +212,13 @@ static err_t connection_callback(void *arg, struct tcp_pcb *newpcb, err_t err) {
 
 void start_http_server(void) {
     struct tcp_pcb *pcb = tcp_new();
-    if (!pcb) return;
-    if (tcp_bind(pcb, IP_ADDR_ANY, 80) != ERR_OK) return;
+    if (!pcb) { log_serial("ERRO: PCB HTTP."); return; }
+    if (tcp_bind(pcb, IP_ADDR_ANY, 80) != ERR_OK) {
+        log_serial("ERRO: Bind porta 80."); return;
+    }
     pcb = tcp_listen(pcb);
     tcp_accept(pcb, connection_callback);
-    log_serial("Servidor HTTP na porta 80.");
+    log_serial("Servidor HTTP OK na porta 80.");
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -257,10 +228,9 @@ int main(void) {
     stdio_init_all();
     sleep_ms(2000);
 
-    log_serial("=== HydroSertao v1.0.0 ===");
+    log_serial("=== HydroSertao v1.1.0 ===");
 
     hardware_init();
-    ws2812_init();
     display_init();
     wifi_init();
     start_http_server();
@@ -268,7 +238,6 @@ int main(void) {
     log_serial("Sistema pronto!");
     buzzer_beep(1000, 200);
     set_led(false, true, false);
-    matriz_mostrar(padrao_sol, 20, 20, 0);
 
     uint32_t ultimo_leitura = 0;
     uint32_t contador       = 0;
@@ -276,38 +245,69 @@ int main(void) {
     while (true) {
         uint32_t agora = to_ms_since_boot(get_absolute_time());
 
+        /* ── Botao B: troca de modo (flag vinda da IRQ) ── */
         if (flag_modo_mudou) {
-            flag_modo_mudou = false;
+            flag_modo_mudou     = false;
             sistema.modo_manual = !sistema.modo_manual;
             buzzer_beep(sistema.modo_manual ? 600 : 1000, 80);
             log_serial(sistema.modo_manual ? "Modo: MANUAL" : "Modo: AUTO");
         }
 
+        /* ── Botao A: ativa emergencia (flag vinda da IRQ) ── */
         if (flag_emergencia) {
-            flag_emergencia = false;
+            flag_emergencia    = false;
             sistema.emergencia = true;
             sistema.irrigando  = false;
+            controlar_irrigacao(false);
             set_led(true, false, false);
             log_serial("EMERGENCIA ativada!");
         }
 
+        /* ── Buzzer intermitente de emergencia (nao bloqueante) ──────
+         * A cada BUZZER_EMERG_MS (500 ms) alterna entre buzzer_ligar()
+         * e buzzer_desligar() usando apenas timestamp — sem sleep_ms().
+         * Isso garante que cyw43_arch_poll() nunca seja bloqueado
+         * durante o alarme, mantendo Wi-Fi e display funcionando.
+         * Os bips normais (buzzer_beep) continuam disponiveis fora
+         * do estado de emergencia para confirmacoes de acao.
+         * ─────────────────────────────────────────────────────────── */
+        if (sistema.emergencia) {
+            if ((agora - ultimo_bip) >= BUZZER_EMERG_MS) {
+                ultimo_bip = agora;
+                if (buzzer_emerg_on) {
+                    buzzer_desligar();
+                    buzzer_emerg_on = false;
+                } else {
+                    buzzer_ligar(500);
+                    buzzer_emerg_on = true;
+                }
+            }
+        } else if (buzzer_emerg_on) {
+            buzzer_desligar();
+            buzzer_emerg_on = false;
+        }
+
+        /* ── Leitura periodica dos sensores (1 s) ── */
         if ((agora - ultimo_leitura) >= INTERVALO_MS) {
             ultimo_leitura = agora;
 
             sistema.umidade     = ler_umidade();
             sistema.temperatura = ler_temperatura();
 
+            /* Controle automatico — inativo em emergencia ou modo manual */
             if (!sistema.emergencia && !sistema.modo_manual) {
-                if (sistema.umidade < UMIDADE_MINIMA && !sistema.irrigando)
+                if (sistema.umidade < UMIDADE_MINIMA && !sistema.irrigando) {
                     controlar_irrigacao(true);
-                else if (sistema.umidade >= UMIDADE_MAXIMA && sistema.irrigando)
+                    log_serial("AUTO: Irrigacao LIGADA");
+                } else if (sistema.umidade >= UMIDADE_MAXIMA && sistema.irrigando) {
                     controlar_irrigacao(false);
+                    log_serial("AUTO: Irrigacao DESLIGADA");
+                }
             }
 
             if (sistema.irrigando) sistema.tempo_irrigando++;
 
             atualizar_display();
-            atualizar_matriz();
 
             if (contador % 5 == 0) {
                 char buf[128];
@@ -321,23 +321,19 @@ int main(void) {
             contador++;
         }
 
-        if (sistema.emergencia) {
-            set_led(true, false, false);
-            matriz_mostrar(padrao_x, 30, 0, 0);
-            atualizar_display();
-            /* Buzzer de alerta: dois bips curtos */
-            buzzer_beep(800, 80);
-            sleep_ms(80);
-            buzzer_beep(800, 80);
-            sleep_ms(500);
-            /* Reset: pressionar Botão A por 1s */
-            if (!gpio_get(BTN_A_PIN)) {
-                sleep_ms(1000);
-                if (!gpio_get(BTN_A_PIN)) {
+        /* ── Reset de emergencia: manter Botao A pressionado 2 s ── */
+        if (sistema.emergencia && !gpio_get(BTN_A_PIN)) {
+            uint32_t t0 = to_ms_since_boot(get_absolute_time());
+            while (!gpio_get(BTN_A_PIN)) {
+                cyw43_arch_poll();
+                sleep_ms(10);
+                if ((to_ms_since_boot(get_absolute_time()) - t0) >= RESET_EMERG_MS) {
                     sistema.emergencia = false;
-                    log_serial("Emergencia resetada.");
+                    buzzer_desligar();
+                    buzzer_emerg_on = false;
                     set_led(false, true, false);
-                    matriz_mostrar(padrao_sol, 20, 20, 0);
+                    log_serial("Emergencia resetada.");
+                    break;
                 }
             }
         }
@@ -368,9 +364,11 @@ void hardware_init(void) {
     gpio_init(BTN_A_PIN); gpio_set_dir(BTN_A_PIN, GPIO_IN); gpio_pull_up(BTN_A_PIN);
     gpio_init(BTN_B_PIN); gpio_set_dir(BTN_B_PIN, GPIO_IN); gpio_pull_up(BTN_B_PIN);
 
-    gpio_set_irq_enabled_with_callback(BTN_A_PIN, GPIO_IRQ_EDGE_FALL, true, &callback_emergencia);
+    gpio_set_irq_enabled_with_callback(BTN_A_PIN, GPIO_IRQ_EDGE_FALL,
+        true, &callback_emergencia);
     gpio_set_irq_enabled(BTN_B_PIN, GPIO_IRQ_EDGE_FALL, true);
-    irq_add_shared_handler(IO_IRQ_BANK0, callback_modo, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
+    irq_add_shared_handler(IO_IRQ_BANK0, callback_modo,
+        PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
 
     i2c_init(I2C_PORT, I2C_FREQ);
     gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
@@ -386,66 +384,35 @@ void hardware_init(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * WS2812 INIT
- * ═══════════════════════════════════════════════════════════════════ */
-void ws2812_init(void) {
-    ws_offset = pio_add_program(ws_pio, &ws2812_program);
-    ws_sm     = pio_claim_unused_sm(ws_pio, true);
-
-    pio_sm_config c = pio_get_default_sm_config();
-    sm_config_set_set_pins(&c, WS2812_PIN, 1);
-    sm_config_set_out_shift(&c, false, true, 24);
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
-
-    // Divisor para ~10MHz efetivo (cada bit = 10 ciclos = 1us)
-    float div = (float)clock_get_hz(clk_sys) / 10000000.f;
-    sm_config_set_clkdiv(&c, div);
-
-    pio_gpio_init(ws_pio, WS2812_PIN);
-    pio_sm_set_consecutive_pindirs(ws_pio, ws_sm, WS2812_PIN, 1, true);
-    pio_sm_init(ws_pio, ws_sm, ws_offset, &c);
-    pio_sm_set_enabled(ws_pio, ws_sm, true);
-
-    sleep_ms(10);
-    matriz_apagar();
-    log_serial("Matriz WS2812 iniciada.");
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * DISPLAY INIT — logo 🌊🌵 HydroSertão
+ * DISPLAY INIT
  * ═══════════════════════════════════════════════════════════════════ */
 void display_init(void) {
     ssd1306_init();
     ssd1306_clear();
 
-    /* Desenha onda (logo) no topo — pixels manuais */
-    // Onda simples linha por linha
-    int onda[] = {4,3,2,2,3,4,5,6,6,5,4,3,2,2,3,4,5,6,6,5,
-                  4,3,2,2,3,4,5,6,6,5,4,3,2,2,3,4,5,6,6,5,
-                  4,3,2,2,3,4,5,6,6,5,4,3,2,2,3,4,5,6,6,5,
-                  4,3,2,2,3,4,5,6,6,5,4,3,2,2,3,4,5,6,6,5,
-                  4,3,2,2,3,4,5,6,6,5,4,3,2,2,3,4,5,6,6,5,
-                  4,3,2,2,3,4,5,6,6,5,4,3,2,2,3,4,5,6,6,5,
-                  4,3,2,2,3,4,5,6,6,5};
-    for (int x = 0; x < 128 && x < (int)(sizeof(onda)/sizeof(onda[0])); x++) {
-        for (int y = onda[x]; y < onda[x] + 2; y++)
-            ssd1306_draw_pixel(x, y, true);
+    int onda[] = {
+        8,7,6,5,5,6,7,8,9,10,10,9, 8,7,6,5,5,6,7,8,9,10,10,9,
+        8,7,6,5,5,6,7,8,9,10,10,9, 8,7,6,5,5,6,7,8,9,10,10,9,
+        8,7,6,5,5,6,7,8,9,10,10,9, 8,7,6,5,5,6,7,8,9,10,10,9,
+        8,7,6,5,5,6,7,8,9,10,10,9, 8,7,6,5,5,6,7,8,9,10,10,9,
+        8,7,6,5,5,6,7,8,9,10,10,9, 8,7,6,5,5,6,7,8,9,10,10,9,
+        8,7,6,5,5,6
+    };
+    for (int x = 0; x < 126; x++) {
+        ssd1306_draw_pixel(x, onda[x],     true);
+        ssd1306_draw_pixel(x, onda[x] + 1, true);
     }
 
-    /* Cacto simples no canto direito */
-    // Tronco
-    for (int y = 2; y < 14; y++) ssd1306_draw_pixel(120, y, true);
-    // Braço esquerdo
-    for (int x = 116; x < 120; x++) ssd1306_draw_pixel(x, 6, true);
-    for (int y = 4; y < 7; y++) ssd1306_draw_pixel(116, y, true);
-    // Braço direito
-    for (int x = 121; x < 125; x++) ssd1306_draw_pixel(x, 8, true);
-    for (int y = 6; y < 9; y++) ssd1306_draw_pixel(124, y, true);
+    for (int y = 2; y < 13; y++)     ssd1306_draw_pixel(122, y, true);
+    for (int x = 118; x <= 122; x++) ssd1306_draw_pixel(x, 6, true);
+    for (int y = 4;   y <= 6;   y++) ssd1306_draw_pixel(118, y, true);
+    for (int x = 122; x <= 126; x++) ssd1306_draw_pixel(x, 8, true);
+    for (int y = 6;   y <= 8;   y++) ssd1306_draw_pixel(126, y, true);
 
-    /* Texto centralizado */
-    ssd1306_draw_string(14, 20, "HydroSertao");
-    ssd1306_draw_string(4,  32, "Irrigacao Inteligente");
-    ssd1306_draw_string(22, 44, "EmbarcaTech 2025");
+    ssd1306_draw_string(12, 16, "** HydroSertao **");
+    ssd1306_draw_string(6,  28, "Irrigacao Inteligente");
+    ssd1306_draw_string(16, 40, "EmbarcaTech 2025");
+    ssd1306_draw_string(10, 52, "Jorgenaldo Moraes");
 
     ssd1306_show();
     sleep_ms(3000);
@@ -453,7 +420,7 @@ void display_init(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * WI-FI INIT — mostra IP no display
+ * WI-FI INIT
  * ═══════════════════════════════════════════════════════════════════ */
 void wifi_init(void) {
     if (cyw43_arch_init()) { log_serial("ERRO: Wi-Fi!"); return; }
@@ -461,10 +428,11 @@ void wifi_init(void) {
     log_serial("Conectando Wi-Fi...");
 
     ssd1306_clear();
-    ssd1306_draw_string(0, 28, "Conectando WiFi...");
+    ssd1306_draw_string(0, 24, "Conectando WiFi...");
     ssd1306_show();
 
-    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 15000)) {
+    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD,
+            CYW43_AUTH_WPA2_AES_PSK, 15000)) {
         log_serial("Wi-Fi FALHOU.");
         ssd1306_clear();
         ssd1306_draw_string(0, 28, "WiFi FALHOU!");
@@ -472,9 +440,10 @@ void wifi_init(void) {
         return;
     }
 
-    uint8_t *ip = (uint8_t*)&(cyw43_state.netif[0].ip_addr.addr);
+    uint8_t *ip = (uint8_t *)&(cyw43_state.netif[0].ip_addr.addr);
     char ip_str[20];
-    snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+    snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+             ip[0], ip[1], ip[2], ip[3]);
 
     char msg[48];
     snprintf(msg, sizeof(msg), "Wi-Fi OK! IP: %s", ip_str);
@@ -482,9 +451,9 @@ void wifi_init(void) {
 
     ssd1306_clear();
     ssd1306_draw_string(0,  0, "WiFi conectado!");
-    ssd1306_draw_string(0, 12, "Acesse:");
-    ssd1306_draw_string(0, 24, ip_str);
-    ssd1306_draw_string(0, 36, "no navegador");
+    ssd1306_draw_string(0, 12, "Acesse no navegador:");
+    ssd1306_draw_string(0, 26, ip_str);
+    ssd1306_draw_string(0, 40, "porta 80");
     ssd1306_show();
     sleep_ms(4000);
 }
@@ -497,7 +466,7 @@ float ler_umidade(void) {
     uint32_t soma = 0;
     for (int i = 0; i < 8; i++) { soma += adc_read(); sleep_us(100); }
     float u = ((float)(soma / 8) / 4095.0f) * 100.0f;
-    if (u < 0.0f) u = 0.0f;
+    if (u < 0.0f)   u = 0.0f;
     if (u > 100.0f) u = 100.0f;
     return u;
 }
@@ -514,8 +483,12 @@ float ler_temperatura(void) {
 void controlar_irrigacao(bool ligar) {
     sistema.irrigando = ligar;
     set_led(false, !ligar, ligar);
-    if (ligar) { buzzer_beep(800, 150); log_serial("Irrigacao: LIGADA"); }
-    else       { log_serial("Irrigacao: DESLIGADA"); }
+    if (ligar) {
+        buzzer_beep(800, 150);
+        log_serial("Irrigacao: LIGADA");
+    } else {
+        log_serial("Irrigacao: DESLIGADA");
+    }
 }
 
 void set_led(bool r, bool g, bool b) {
@@ -524,7 +497,8 @@ void set_led(bool r, bool g, bool b) {
     gpio_put(LED_B_PIN, b);
 }
 
-void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms) {
+/* Liga o buzzer via PWM de forma continua (sem bloqueio) */
+void buzzer_ligar(uint32_t freq_hz) {
     uint slice = pwm_gpio_to_slice_num(BUZZER_PIN);
     uint chan  = pwm_gpio_to_channel(BUZZER_PIN);
     uint32_t div = 125000000 / (freq_hz * 4096);
@@ -533,13 +507,23 @@ void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms) {
     pwm_set_wrap(slice, 4095);
     pwm_set_chan_level(slice, chan, 2048);
     pwm_set_enabled(slice, true);
-    sleep_ms(duracao_ms);
-    pwm_set_enabled(slice, false);
+}
+
+/* Desliga o buzzer imediatamente */
+void buzzer_desligar(void) {
+    pwm_set_enabled(pwm_gpio_to_slice_num(BUZZER_PIN), false);
     gpio_put(BUZZER_PIN, 0);
 }
 
+/* Bip bloqueante — confirmacoes pontuais fora da emergencia */
+void buzzer_beep(uint32_t freq_hz, uint32_t duracao_ms) {
+    buzzer_ligar(freq_hz);
+    sleep_ms(duracao_ms);
+    buzzer_desligar();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
- * DISPLAY — layout do arquivo que funcionou bem
+ * DISPLAY OLED — atualizacao periodica
  * ═══════════════════════════════════════════════════════════════════ */
 void atualizar_display(void) {
     ssd1306_clear();
@@ -555,39 +539,21 @@ void atualizar_display(void) {
     ssd1306_draw_string(0, 22, buf);
 
     if (sistema.emergencia)
-        ssd1306_draw_string(0, 32, "Irrig: !EMERG!");
+        ssd1306_draw_string(0, 32, "!!! EMERGENCIA !!!");
     else {
-        snprintf(buf, sizeof(buf), "Irrig: %s", sistema.irrigando ? "LIGADA " : "DESLIG.");
+        snprintf(buf, sizeof(buf), "Irrig: %s",
+                 sistema.irrigando ? "LIGADA " : "DESLIG.");
         ssd1306_draw_string(0, 32, buf);
     }
 
-    snprintf(buf, sizeof(buf), "Modo : %s", sistema.modo_manual ? "MANUAL  " : "AUTO    ");
+    snprintf(buf, sizeof(buf), "Modo : %s",
+             sistema.modo_manual ? "MANUAL  " : "AUTO    ");
     ssd1306_draw_string(0, 42, buf);
 
     snprintf(buf, sizeof(buf), "TIrr : %lu s", sistema.tempo_irrigando);
     ssd1306_draw_string(0, 52, buf);
 
     ssd1306_show();
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * MATRIZ
- * ═══════════════════════════════════════════════════════════════════ */
-void atualizar_matriz(void) {
-    if (sistema.emergencia) {
-        static bool pisc = false;
-        pisc = !pisc;
-        if (pisc) matriz_mostrar(padrao_x, 30, 0, 0);
-        else      matriz_apagar();
-    } else if (sistema.modo_manual) {
-        matriz_mostrar(padrao_manual, 20, 20, 0);
-    } else if (sistema.irrigando) {
-        matriz_mostrar(padrao_gota, 0, 0, 30);
-    } else {
-        uint8_t b = (uint8_t)(sistema.umidade / 100.0f * 25.0f);
-        if (b < 5) b = 5;
-        matriz_mostrar(padrao_sol, b, b, 0);
-    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -600,7 +566,7 @@ void log_serial(const char *msg) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * CALLBACKS — só flags, zero bloqueio
+ * CALLBACKS — apenas sinalizam flags; zero processamento em IRQ
  * ═══════════════════════════════════════════════════════════════════ */
 void callback_emergencia(uint gpio, uint32_t events) {
     if (gpio == BTN_A_PIN && (events & GPIO_IRQ_EDGE_FALL))

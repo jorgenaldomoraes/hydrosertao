@@ -16,16 +16,16 @@ cmake_minimum_required(VERSION 3.13)
 
 set(PICO_BOARD pico_w CACHE STRING "Board type")
 
-# CRITICO: inclui src/ ANTES do SDK para o lwipopts.h ser encontrado
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+include(pico_sdk_import.cmake)
 
 project(hydrosertao C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
+set(PICO_CYW43_FIRMWARE_SOURCE "embedded")
 
 add_executable(hydrosertao
     src/main.c
@@ -35,7 +35,6 @@ add_executable(hydrosertao
 pico_set_program_name(hydrosertao "HydroSertao")
 pico_set_program_version(hydrosertao "1.0.0")
 
-# USB=0 para a placa rodar corretamente sem PC conectado
 pico_enable_stdio_uart(hydrosertao 1)
 pico_enable_stdio_usb(hydrosertao 0)
 
@@ -45,15 +44,13 @@ target_include_directories(hydrosertao PRIVATE
 
 target_link_libraries(hydrosertao
     pico_stdlib
-    pico_cyw43_arch_lwip_poll
+    pico_cyw43_arch_lwip_threadsafe_background
     hardware_adc
     hardware_gpio
     hardware_i2c
     hardware_uart
     hardware_pwm
     hardware_irq
-    hardware_pio
-    hardware_clocks
 )
 
 pico_add_extra_outputs(hydrosertao)
